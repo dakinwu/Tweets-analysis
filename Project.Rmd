@@ -1,0 +1,831 @@
+---
+header-includes:
+- \usepackage{fontspec} # 使用 fontspec package
+- \usepackage{xeCJK}    # 使用 xeCJK package
+- \setCJKmainfont{標楷體} # 指定主要的字型，windows 使用者可用「標楷體」、「新細明體」，或是依照您安裝的字型名稱輸入
+output: 
+  pdf_document: 
+    keep_tex: yes # 保留 tex 檔，萬一出了問題，可以手動檢查並重新編譯
+    latex_engine: xelatex # latex 引擎設定為 xelatex
+    toc: true
+    number_sections: true
+indent: true
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tm) # for NLP
+#library(RWeka)
+library(ranger)
+library(plyr) #  for pre-processing 
+library(tidyverse) # for pre-processing and visualisation
+library(reshape2) # for melt function
+library(e1071) # for Naive Bayes classifier
+library(glmnet) # for Logistic Regression classifier
+library(randomForest) # for Random Forest classifier
+library(caret)
+library(ROCit)
+library(gmodels)
+library(factoextra)
+library(irlba) # singular values Decomp.
+
+library(tidyverse)
+library(stringi)
+library(tm)
+library(irlba)
+library(gridExtra)
+library(caret)
+library(NbClust)
+library(caretEnsemble)
+```
+
+\newpage
+
+# Introduction and Data Description
+
+## 分析目的
+
+現今Twitter成爲了人們經常使用的資訊交流平臺，意外或事故的情報分享也不例外，人手一機的條件更讓大家幾乎能即時的發佈自己遇到的緊急事態，然而也會存在一些包含事故字眼的貼文，實際上只是作者幽默的玩笑。因此我們便想去瞭解，是否能藉由統計方法來判別Twitter上的事故貼文是否爲真。此外我們也會試著去比較幾種演算法的差異和判斷正確率。希望透過這次其中報告，將這半學期所學融會溝通。
+
+## 資料說明
+
+為探究是否一則推特貼文是關於一個真實發生的事故，我們取用appen(https://appen.com/resources/datasets)
+上的公開資料庫。該資料集上有7613個觀察值，包含4個欄位：
+
+|變數類別|變數名稱|變數解釋|
+|:---:|:---:|:---:|
+|Covariates|ID|推特貼文識別碼|
+||Text|推特貼文文字內容|
+||Location|推特的發文地點|
+||KeyWord|推特貼文中的特定單詞|
+
+## 分析流程
+
+在本次的文字探勘當中，我們的目標為將其分為兩個叢集，第一步我們會進行資料探索，了解關鍵字與全文內容、發文地點等的關係。對資料有一定的認識後，我們使用了3種機器學習的演算法建立模型對資料集進行集群分析，並藉由模擬資料來檢定各個模型的準確率。
+
+
+
+### Loading Buzzfeed datasets:
+
+```{r, echo=FALSE, message=FALSE, warnings=FALSE}
+tweets_train <- read.csv('./train.csv', stringsAsFactor = F, na.strings = c(""))
+tweets_test <- read.csv('./test.csv', stringsAsFactor = F, na.strings = c(""))
+```
+
+```{r, echo=FALSE}
+dim(tweets_test)
+dim(tweets_train)
+```
+
+### Pre- processing / Feature Engineering
+
+```{r, echo=FALSE}
+tweets_complete <- bind_rows(tweets_train, tweets_test)
+glimpse(tweets_complete)
+```
+
+```{r, echo=FALSE}
+#
+tweets_train  <- tweets_train %>% 
+    mutate(
+        target = as.factor(case_when(target == 0 ~ 'No',
+                                     target == 1 ~ 'Yes'))
+    )%>%
+    dplyr::select(everything())
+
+#
+tweets_complete <- tweets_complete %>% 
+    mutate(
+        target = as.factor(case_when(target == 0 ~ 'No',
+                                     target == 1 ~ 'Yes'))
+    )%>%
+    dplyr::select(everything())
+```
+
+```{r, echo=FALSE}
+head(unique(tweets_complete$keyword))
+head(unique(tweets_complete$location))
+```
+
+#### Missing Values
+
+```{r, echo=FALSE}
+missing_data <- colSums(sapply(tweets_complete, is.na))
+missing_data
+```
+
+There is quite a large number of tweets, for which location is missing. This could potentialy be a good predictor in itself. There are no missing values in text and target variable. 3263 missing values in target variable is coming from test data frame.
+
+#### New Features
+
+```{r, echo=FALSE}
+tweets_train$TextLength <- sapply(tweets_train$text, str_length)
+
+tweets_complete$TextLength <- sapply(tweets_complete$text, str_length)
+summary(tweets_complete$TextLength)
+```
+
+
+# EDA 
+
+## Text Features Analysis
+
+### Analysis on text length
+
+```{r, echo=FALSE}
+library(wordcloud)
+train_data_disaster <- tweets_train %>% filter(target == 'Yes')
+# Create a corpus object
+corpus_disaster <- Corpus(VectorSource(train_data_disaster$text))
+
+#corpus_disaster[[1]][1]
+#train_data_disaster$text[1]
+
+# Remove punctuation
+corpus_disaster <- tm_map(corpus_disaster, removePunctuation)
+# Remove stop words
+corpus_disaster <- tm_map(corpus_disaster, removeWords, stopwords(kind = "en"))
+# Stemming
+corpus_disaster <- tm_map(corpus_disaster, stemDocument)
+# Word frequency using temp document matrix
+frequencies_disaster <- TermDocumentMatrix(corpus_disaster)
+# remove sparse data
+sparse_data_disaster <- removeSparseTerms(frequencies_disaster, 0.995)
+#
+sparse_data_df_disaster <- as.data.frame(as.matrix(sparse_data_disaster))
+description_matrix_disaster <- as.matrix(sparse_data_df_disaster)
+# Total count for each word
+v_disaster <- sort(rowSums(description_matrix_disaster),decreasing=TRUE)
+d_disaster <- data.frame(word = names(v_disaster),freq=v_disaster)
+head(d_disaster, 10)
+# Word cloud
+set.seed(2020)
+resize <- function(w=6,h=6){
+  windows(record=TRUE, width = w, height = h)
+}
+resize(10,10)
+wordcloud(words = d_disaster$word, freq = d_disaster$freq, min.freq = 1,
+          max.words=20000, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+```
+
+
+```{r, echo=FALSE}
+# perform t-test
+t.test(tweets_train[tweets_train$target == "Yes",]$TextLength, tweets_train[tweets_train$target == "No",]$TextLength)
+
+# plotting histogram of text length
+ggplot(tweets_train ,aes(x=TextLength, fill=target)) +
+    ggtitle('Density distribuiton of text length for Tweets') +
+    geom_density(alpha=0.5) +
+    guides(fill=guide_legend(title='reliability')) + 
+    labs(x='Text length', y='Density')
+```
+
+事故實際未發生時，其分布會較為平均；但倘若實際發生的話，其推文文長會集中在字數較長的區間，而在字數較少的區間其頻率皆低於未發生的情況。
+
+
+## Text of Tweets Analysis
+
+### Text Cleansing
+
+#### Unigrams
+
+1. Convert text to lower case
+
+2. Remove numbers, punctuation, special characters, extra whitespaces, etc. (remove whitespaces after step 5.)
+
+3. Remove stopwords (English), common words.
+
+4. Remove common news source names
+
+5. Stemming words to root words
+
+6. Ignore overly sparse and common terms (less than 1%, more than 80%)
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+removeURL <- function(x) {
+    gsub("http[^[:space:]]*", "", x)
+}
+
+removeUser <- function(x){
+    gsub("@[^[:space:]]*", "", x)
+}
+
+removeNumPunct <- function(x){
+    gsub("[^[:alpha:][:space:]]*", "", x) 
+} 
+
+removeSingle <- function(x){
+    gsub(" . ", " ", x)   
+}
+
+clean_specialChar <- function(x){
+    gsub("…|⋆|–|‹|”|“|‘|’",'',x)
+}
+
+StopWords <- c((stopwords('english')), 
+                 c("really", "tweets", "saw", "just", "feel", "may", "us", "rt", "every", "one",
+                   "amp", "like", "will", "got", "new", "can", "still", "back", "top", "much",
+                   "near", "im", "see", "via", "get", "now", "come", "oil", "let", "god", "want",
+                   "pm", "last", "hope", "since", "everyone", "food", "content", "always", "th",
+                   "full", "found", "dont", "look", "cant", "mh", "lol", "set", "old", "service",
+                   "city", "home", "live", "night", "news", "say", "video", "people", "ill", 
+                   "way",  "please", "years", "take", "homes", "read", "man", "next", "cross", 
+                   "boy", "bad", "ass", "love", "news"))
+
+preprocess_corpus <- function(corpus, stemming=TRUE){
+    corpus <- Corpus(VectorSource(corpus))
+    
+    corpus <- tm_map(corpus, content_transformer(removeURL))
+    corpus <- tm_map(corpus, content_transformer(removeUser))
+
+    corpus <- tm_map(corpus, content_transformer(stri_trans_tolower))
+    corpus <- tm_map(corpus, content_transformer(removeNumPunct))
+    #corpus <- tm_map(corpus, removeNumbers)
+    #corpus <- tm_map(corpus, removePunctuation)
+    corpus <- tm_map(corpus, removeWords, StopWords)
+    corpus <- tm_map(corpus, function(x) iconv(x, "latin1", "ASCII", sub=""))
+    corpus <- tm_map(corpus, removeSingle)
+    if(stemming==TRUE){
+      corpus <- tm_map(corpus, stemDocument)
+    }
+    corpus <- tm_map(corpus, stripWhitespace)
+    
+    dtM <- DocumentTermMatrix(corpus)
+    return(dtM)
+}
+```
+
+#### Bigrams
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+bigramTokenizer <- function(x){
+    unlist(lapply(ngrams(words(x), 2), paste, collapse = " "), use.names = FALSE)
+}
+
+bigram_corpus <- function(corpus, minIgnore=.01, maxIgnore=.80){
+    corpus <- VCorpus(VectorSource(corpus))
+    
+    corpus <- tm_map(corpus, content_transformer(stri_trans_tolower))
+    corpus <- tm_map(corpus, removeWords, StopWords)
+    
+    corpus_len <- length(corpus)
+    minDocFreq <- corpus_len * minIgnore
+    maxDocFreq <- corpus_len * maxIgnore
+    
+    bigM <- DocumentTermMatrix(corpus, control=list(tokenize=bigramTokenizer,
+                                                    removePunctuation=TRUE,
+                                                    stemming = FALSE,
+                                                    global=c(minDocFreq, maxDocFreq)))
+    #bigM <- as.matrix(bigM)
+    return(bigM)
+}
+```
+
+### Word Frequency - find top n representative words (unigrams)
+
+We first perform chi-square test to check association of a word with fake and real category. Then, we sort all words on the basis of the statistics given and select top 15 words.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+top_unigram <- function(dtMatrix, type, top_n=15){
+    dtM_df <- data.frame(as.matrix(dtMatrix))
+    
+    chi2Vals <- apply(dtM_df, 2, function(x){
+        chisq.test(as.numeric(x), type)$statistic
+    })
+    words_subset <- names(sort(chi2Vals, decreasing=TRUE))[1:top_n]
+    
+    dtM_df$type <- type
+    freq_df <- dtM_df %>% 
+        group_by(type) %>% 
+        summarise_each(funs(sum))
+    top_n <- freq_df[, c(words_subset, 'type')]
+    return(top_n)
+}
+```
+
+
+
+### Word Frequency - find top n representative words (bigrams)
+
+```{r, echo=FALSE, }
+top_bigram <- function(dtMatrix, type, top_n=20){
+    dtMatrix <- as.matrix(dtMatrix)
+    bigrams <- names(sort(colSums(dtMatrix), decreasing=TRUE))
+    
+    top_bigram_list <- c()
+    for(bigram in bigrams){
+        unigrams <- strsplit(bigram," ")
+        removal <- c(unlist(stopwords('en')))
+        if(!(unigrams[[1]][1] %in% removal | unigrams[[1]][2]  %in% removal)){
+            top_bigram_list <- c(top_bigram_list, bigram)
+        }
+        if (length(top_bigram_list) ==top_n){
+            break
+        }
+    }
+    
+    dtM_bigram <- data.frame(dtMatrix[, intersect(colnames(dtMatrix), top_bigram_list)])
+    dtM_bigram$type <- type
+    freq_df <- dtM_bigram %>%
+        group_by(type) %>%
+        summarise_each(funs(sum))
+
+    return(freq_df)
+}
+```
+
+### Analysis on Tweets (Unigrams)
+
+#### Bar Plot
+
+```{r, echo=FALSE, eval=FALSE, message=FALSE, warning=FALSE}
+text_dtM <- preprocess_corpus(tweets_train$text)
+text_top_n <- top_unigram(text_dtM, tweets_train$target, top_n=25)
+
+ggplot(melt(text_top_n), aes(x=variable, y=value, fill=type)) + 
+    ggtitle('Most Discriminatory Words in the Articles of News') + 
+    geom_col(position='dodge') +
+    labs(x='Top 25', y='Term Frequency') +
+    coord_flip()
+```
+
++ Bomb：「有事故」的出現頻率遠高於「實際未發生」。
++ Fire：「有事故」的出現頻率遠高於「實際未發生」。
++ Kill：「有事故」的出現頻率遠高於「實際未發生」。
+  
+這三者為描述上較嚴肅的詞，且與人身安全密切相關，故推文者理應會較為慎重地使用。
+
+
+
+### Analysis on Buzzfeed news articles (Bigrams)
+
+```{r, echo=FALSE, eval=FALSE, message=FALSE, warning=FALSE}
+text_dtM_bigram <- bigram_corpus(tweets_train$text)
+text_top_n_bigram <- top_bigram(text_dtM_bigram, tweets_train$target, top_n=20)
+
+ggplot(melt(text_top_n_bigram), aes(x=variable, y=value, fill=type)) + 
+    ggtitle('Most Discriminatory Bigrams in the Articles of News') + 
+    geom_col(position='dodge') +
+    labs(x='Top 25', y='Term Frequency') +
+    coord_flip()
+```
+
+根據雙單詞分析，當「suicide」與「bomber」、「bombing」同時出現時，不僅頻率高且肯定為真實事故；「northern」、「california」
+
+### Tf-Idf function
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# title_dtM <- preprocess_corpus(buzzfeed$title)
+# text_dtM <- preprocess_corpus(buzzfeed$text)
+text_dtM <- preprocess_corpus(tweets_train$text)
+tf.idf <- function(corpus){
+    corpus <- Corpus(VectorSource(corpus))
+    
+    corpus <- tm_map(corpus, content_transformer(removeURL))
+    corpus <- tm_map(corpus, content_transformer(removeUser))
+
+    corpus <- tm_map(corpus, content_transformer(stri_trans_tolower))
+    corpus <- tm_map(corpus, content_transformer(removeNumPunct))
+    #corpus <- tm_map(corpus, removeNumbers)
+    #corpus <- tm_map(corpus, removePunctuation)
+    corpus <- tm_map(corpus, removeWords, stopwords('english'))
+    corpus <- tm_map(corpus, removeSingle)
+    corpus <- tm_map(corpus, stemDocument)
+    corpus <- tm_map(corpus, stripWhitespace)
+    
+    
+    dtM <- DocumentTermMatrix(corpus, 
+                              control=list(weighting=function(x) weightTfIdf(x, normalize=TRUE)))
+    #dtM <- as.matrix(dtM)
+    return(dtM)
+}
+```
+
+\newpage
+
+# Method
+
+## K-Means
+
+K-means是一個簡單易懂且利於解釋的分類演算法,其想法為在事先給定$K$個群集下，最小化群内的資料與群心的誤差平方和，公式可以寫爲
+
+$$ \underset{\mu}{argmin} \sum_{c=1}^K \sum_{i=1}^{n_c} ||x_i - \mu_c||^2 \; \bigg|_{x_i \in S_c}$$
+
+$\mu_c$就是群心，$||x-y||$就是算歐氏距離(Euclidean distance)，$S_c$則代表第$c$個群集(cluster)。其演算法為：
+
+1. 設定k個群心
+
+$$\mu_c^{(0)} \in R^d, \quad c=1, 2, ..., K$$
+
+2. 將每個樣本分到與其最接近的群心所屬的群集中
+
+$$S_c^{(t)} = \{ x_i : || x_i - \mu_c^{(t)}|| \leq ||x_i - \mu_{c^*}^{(t)}||, \forall \; i= 1,...,n\}$$
+
+3. 結合新加入的資料計算新的群心(第$c$群内有$n_c$個資料)
+
+$$\mu_c^{t+1} = \frac{sum(S_c^{(t)})}{n_c} = \sum_{i=1}^{n_c} x_i \; \bigg|_{x_i \in S_c}$$
+
+4. 重複2和3直到群心收斂不變
+
+$$S_c^{(t+1)} = S_c^{(t)}, \quad \forall \; c = 1,...,K$$
+
+群集數量K值的決定與起始群心的決定都會對模型造成影響，群集數量可以使用Hierarchical Clustering的方法尋找適合的數值，而起始值的問題則可藉由以不同的起始值多次執行模型，再從中取出最佳結果的方式來排除。
+
+## Gaussian Mixture Model
+
+高斯混合模型（Gaussian Mixture Model，簡稱GMM)是單一高斯機率密度函數的延伸，
+指的是多個高斯分布函數的線性組合，由於GMM能夠平滑地近似任意形狀的密度分佈，因此近來常被用在語音辨識並得到不錯的效果。
+
++ 單一高斯機率密度函數
+
+$$N(x;\mu,\Sigma) = \frac{1}{\sqrt{(2\pi)^d|\Sigma|}} exp \bigg[-\frac{1}{2}(x-\mu)^T \Sigma^{-1}(x-\mu) \bigg]$$
+
+其中$\mu$代表此密度函數的中心點，$\Sigma$則代表此密度函數的共變異矩陣（Covariance Matrix）。
+
++ 推導GMM流程：
+
+設一隨機變數：
+
+$$\mathbf{z} = [z_1, z_2, ..., z_K]$$
+
+當$z_k = 1$且$z_i=0,\; i\neq k$，
+代表第$k$個袋子被選中，其屬於第$k$個叢集；
+由於此變數無法量測，故稱之為隱含變量（latent variable）。
+
+$$p(z_k=1) = \alpha_k, \quad k=1,...,K$$
+
+其中$\alpha_k$為屬於第k個叢集的事前機率。
+
+概似函數：
+
+$$p(x|\mathbf{z}) = \prod_{k=1}^K p(x|z_k=1)^{z_k} = \prod_{k=1}^K p(x|\mu_k, \Sigma_k)^{z_k}$$
+
+把所有z可能的概似函數乘上先驗機率再相加：
+
+$$p(x|\Theta) = \sum_z p(x|\mathbf{z})p(z) = \sum_{k=1}^K p(x|z_k=1)p(z_k=1)=\sum_{k=1}^K \alpha_k p(x|\mu_k, \Sigma_k)$$
+
+其中的$\Theta$稱為高斯混合模型的參數集。
+
+$$\Theta = \{\alpha_k; \mu_k, \Sigma_k \}_{k=1}^K$$
+
+把高斯分佈寫進去替換以上機率模式，得到以下高斯混合模型：
+
+$$
+\begin{aligned}
+p(x|\Theta) &= \sum_{k=1}^K \alpha_k N(x|\mu_k, \Sigma_k) \\
+\sum_{k=1}^K \alpha_k &= \;1,\quad 0 \leq \alpha_k \leq 1 \\
+N(x|\mu_k, \Sigma_k) &= \frac{1}{\sqrt{(2\pi)^d|\Sigma_k|}} exp \bigg[-\frac{1}{2}(x-\mu_k)^T \Sigma_k^{-1}(x-\mu_k) \bigg]
+\end{aligned}
+$$
+
+### EM Algorithm
+
+給定樣本集合$\{x_1,x_2,...,x_n\}$，在選取n個樣本後，其概似函數為：
+
+$$
+\begin{aligned}
+L(\Theta) &= \prod_{i=1}^n p(x_i|\Theta) \\
+\Rightarrow lnL(\Theta) &= \sum_{i=1}^n lnp(x_i|\Theta) = \sum_{i=1}^n ln \bigg\{\sum_{k=1}^K p(x_i|z_k =1)p(z_k = 1) \bigg\} = \sum_{i=1}^n ln \bigg\{\sum_{k=1}^K \alpha_k N(x_i|\mu_k, \Sigma_k) \bigg\} 
+\end{aligned}
+$$
+
+EM是一種不斷反覆運算的演算法，所以參數會不斷的更新，此處假設第$t$與$t+1$次估計的參數如下：
+
+$$
+\begin{aligned}
+\Theta^{(t)} &= \bigg\{\alpha_k^{(t)};\, \mu_k^{(t)},\, \Sigma_k^{(t)}\bigg\}_{k=1}^K \\
+\Theta^{(t+1)} &= \bigg\{\alpha_k^{(t+1)};\, \mu_k^{(t+1)},\, \Sigma_k^{(t+1)}\bigg\}_{k=1}^K
+\end{aligned}
+$$
+
++ 演算法流程
+
+假設給定樣本集合${x_1,x_2,...,x_n}$，
+
+1. **初始化參數**：設定K個數，t(第t次計算)設定為$0$
+
+$$\Theta^{(0)} = \bigg\{\alpha_k^{(0)};\, \mu_k^{(0)},\, \Sigma_k^{(0)}\bigg\}_{k=1}^K$$
+
+2. **E-Step**
+
+假設所有參數$Θ^{(t)}$已知，計算下式：
+
+$$w_k^{(t)} (x_i) = p(z_k=1|x_i) = \frac{\alpha_k^{(t)} N\bigg(x_i|\mu_k^{(t)}, \Sigma_k^{(t)}\bigg)}{\sum_{j=1}^K N \bigg(x_i|\mu_j^{(t)}, \Sigma_j^{(t)}\bigg)},\; \forall i, k$$
+
+後驗機率$p(\mathbf{z}|x)$如下：
+
+$$w_k(x) = p(z_k=1|x) = \frac{ p(x|z_k=1)p(z_k=1)}{p(x)} = \frac{\alpha_k N(x|\mu_k, \Sigma_k)}{\sum_{i=1}^K N(x|\mu_i, \Sigma_i)}$$
+
+其中機率和為$1$:
+
+$$\sum_{i=1}^K w_k(x) = \sum_{i=1}^K p(z_k=1|x) = 1$$
+
+藉此方便利用EM演算法來估計GMM的參數。
+
+3. **M-Step**
+
+利用MLE去估計$q(\Theta^{(t)},\Theta^{(t+1)})$的參數$\Theta^{(t+1)}$
+
+$$\Theta^{(t+1)} = \bigg\{\alpha_k^{(t+1)};\, \mu_k^{(t+1)},\, \Sigma_k^{(t+1)}\bigg\}_{k=1}^K$$
+
+
+
+# Model Training
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+text.tfidf <- tf.idf(tweets_train$text)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+frequent_text <- findFreqTerms(text_dtM, 50)  # 5% 180
+
+text.data <- as.matrix(text.tfidf)[, frequent_text]
+label <- ifelse(tweets_train[, c('target')]=='Yes', 1, 2)
+```
+
+## SVD
+
+Feature Extraction Using Singular Value Decomposition (SVD)
+
+Let's try to extract 150 most important singular vectors, which possibly captures more signal than the unigram terms we have in our term document matrix.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+irlba_text <- irlba(t(as.matrix(text_dtM)), nv=30, maxit=102)
+```
+
+## Data
+
+```{r, echo=FALSE, }
+set.seed(100)
+
+data <- data.frame(cbind(irlba_text$v, label))
+colnames(data) <- c(colnames(as.matrix(text_dtM))[1:30], 'label')
+data.matrix <- data[, which(names(data) != 'label')]
+data.label <- data$label
+```
+
+## K-Means
+
++ Elbow Method
+
+```{r, }
+fviz_nbclust(data.matrix, kmeans, method = "wss") +
+  geom_vline(xintercept = 4, linetype = 2)+
+  labs(subtitle = "Elbow method")
+```
+
++ Silhouette Method
+
+```{r echo=FALSE}
+fviz_nbclust(data.matrix, kmeans, method='silhouette')+
+  labs(title='Silhouette Method')
+```
+
+```{r, echo=FALSE, }
+set.seed(10)
+
+kmeans_classifier <- kmeans(x=data.matrix, centers=2, nstart=25)
+correct.clust <- sum(data.label==kmeans_classifier$cluster)
+accuracy <- max(correct.clust, nrow(data) - correct.clust) / nrow(data)
+accuracy
+
+CrossTable(kmeans_classifier$cluster, data$label, prop.chisq=FALSE, prop.t=FALSE, dnn=c('Predicted', 'Actual'))
+```
+
+## Gaussian Mixture Model
+
+```{r, echo=FALSE, }
+set.seed(100)
+library(mclust)
+mm_classifier <- Mclust(data.matrix, G=2:9)
+
+plot.Mclust(mm_classifier, what = "BIC", 
+     ylim = range(mm_classifier$BIC[, ], na.rm = TRUE), 
+     legendArgs = list(x = "topright", cex =0.7))
+```
+
+```{r, echo=FALSE, }
+set.seed(100)
+library(mclust)
+mm_classifier <- Mclust(data.matrix, G=2)
+
+summary(mm_classifier)
+```
+
+```{r, echo=FALSE, }
+CrossTable(mm_classifier$classification, data$label, prop.chisq=FALSE, prop.t=FALSE, dnn=c('Predicted', 'Actual'))
+```
+
+```{r, echo=FALSE, }
+adjustedRandIndex(data$label, mm_classifier$classification)
+```
+
+```{r,}
+gmm.means <- mm_classifier$parameters$mean
+gmm.sigma <- mm_classifier$parameters$variance$sigma
+estimates.1 <- data.frame(text=colnames(data.matrix),
+                          mean=gmm.means[, 1],
+                          sigma=diag(gmm.sigma[, , 1]))
+estimates.2 <- data.frame(text=colnames(data.matrix),
+                          mean=gmm.means[, 2],
+                          sigma=diag(gmm.sigma[, , 2]))
+estimates.0 <- data.frame(text=colnames(data.matrix),
+                     mean.1=gmm.means[, 1],
+                     sigma.1=diag(gmm.sigma[, , 1]),
+                     mean.2=gmm.means[, 2],
+                     sigma.2=diag(gmm.sigma[, , 2]))
+```
+
+```{r,}
+library(ggrepel)
+ggplot(estimates.0[1:15,], aes(x=text, group=1)) + 
+  geom_hline(yintercept = 0,col = 2) + 
+  geom_point(aes(y=mean.1), shape=21, size=3, fill="red") +
+  geom_point(aes(y=mean.2), shape=21, size=3, fill="blue") +
+  labs(title = "Gaussian Mixture Mean Estimates",y = "Estimates.Value") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x=element_text(size=11, angle=30))
+
+```
+
+```{r,}
+library(ggrepel)
+ggplot(estimates.0[16:30,], aes(x=text, group=1)) + 
+  geom_hline(yintercept = 0,col = 2) + 
+  geom_point(aes(y=mean.1), shape=21, size=3, fill="red") +
+  geom_point(aes(y=mean.2), shape=21, size=3, fill="blue") +
+  labs(title = "Gaussian Mixture Mean Estimates",y = "Estimates.Value") +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x=element_text(size=11, angle=30))
+
+```
+
+#######################################這裡開始############################################
+
+
+```{r}
+performance <- function(pred.prob, pred.class, method, test, positive){
+  con <- confusionMatrix(pred.class,test,positive=positive)
+  Sensitivity <- con$byClass[1]
+  Specificity <- con$byClass[2]
+  ROCit_obj <- rocit(score=pred.prob,class=test)
+  AUC <- ROCit_obj$AUC
+  ACC <- sum(pred.class==test)/length(test)
+  
+  plot(ROCit_obj);title(method)
+  text(0.7,0.4,paste("AUC = ",round(AUC,3),"\n","ACC = ",round(ACC,3)),cex = 1.5)
+  return(c(Sensitivity,Specificity,AUC = AUC,ACC=ACC))
+}
+```
+
+```{r}
+label <- ifelse(tweets_train[, c('target')]=='Yes', 1, 0)
+
+data <- data.frame(cbind(irlba_text$v, label))
+colnames(data) <- c(colnames(as.matrix(text_dtM))[1:30], 'label')
+
+train <- createDataPartition(data$label, p=.7, list=FALSE)
+train_data <- data[train, ]
+test_data <- data[-train, ]
+```
+
+## Logistic
+```{r}
+fit_glm <- glm(label ~., data=train_data, family=binomial)
+
+log_prob <- predict(fit_glm, test_data, type="response")
+log_pred <- ifelse(log_prob > 0.5, 1, 0)
+
+cat('accuracy:', mean(log_pred == test_data$label))
+```
+
+```{r}
+cutpoints <- data.frame(cut=seq(0.1, 0.9, by = 0.01),ACC=0)
+for(i in 1:nrow(cutpoints)){
+  pred_log <- ifelse(log_prob > cutpoints$cut[i], 1, 0)
+  cutpoints$ACC[i] <- mean(pred_log ==  test_data$label)
+}
+
+cut_best <- cutpoints$cut[which.max(cutpoints$ACC)]
+log_pred <- ifelse(log_prob > cut_best, 1, 0)
+
+cat('accuracy:', mean(log_pred == test_data$label))
+```
+```{r}
+confusionMatrix(factor(log_pred), factor(test_data$label))
+```
+
+```{r}
+performance(log_prob, as.factor(log_pred), 'Logistic', as.factor(test_data$label), '1')
+```
+
+## Random Forest
+```{r}
+set.seed(101)
+train_data$label <- as.factor(train_data$label)
+rf <- randomForest(label ~., data=train_data)
+
+rf_pred <- predict(rf, newdata=test_data, type = 'class')
+cat('accuracy:', mean(rf_pred == test_data$label))
+```
+
+```{r}
+ntree <- which.min(rf$err.rate[, 1])
+cat('best tree size:', ntree)
+
+hyper_grid <- expand.grid(mtry = seq( 2, 16, by = 1),
+                          node_size = seq(5, 17, by = 2),
+                          sample_size = c(0.575, 0.635, 0.7, 0.8),
+                          OOB_error = 0)
+
+for (i in 1:nrow(hyper_grid)) {
+  # train model
+  model <- ranger(formula = label ~ ., data = train_data, 
+                  num.trees = ntree, 
+                  mtry = hyper_grid$mtry[i],
+                  min.node.size = hyper_grid$node_size[i], 
+                  sample.fraction = hyper_grid$sample_size[i],
+                  seed = 101)
+  
+  hyper_grid$OOB_error[i] <- model$prediction.error
+}
+
+min_OOB_error <- hyper_grid %>% 
+  dplyr::arrange(OOB_error) %>% 
+  head(10)
+
+ACC_rf <- data.frame(mtry=rep(0, 10),
+                     node_size=rep(0, 10),
+                     sample_size=rep(0, 10),
+                     OOB_error=rep(0, 10),
+                     ACC=rep(0, 10))
+
+for (i in 1:10){
+  rf_param <- min_OOB_error[i,]
+  
+  rf_ <- randomForest(formula=label ~., data=train_data,
+                      ntree=ntree, 
+                      mtry=rf_param$mtry,
+                      nodesize=rf_param$node_size,
+                      sampsize=ceiling(rf_param$sample_size * nrow(train_data)))
+  
+  rf_pred <- predict(rf_, newdata=test_data, type='class')
+  acc <- mean(rf_pred==test_data$label)
+  ACC_rf[i, ] <- cbind(min_OOB_error[i,], ACC=acc)
+}
+
+best_rf_param <- ACC_rf %>%
+  dplyr::arrange(desc(ACC)) %>%
+  head(1)
+```
+
+```{r}
+set.seed(100)
+rf_best <- randomForest(formula=label ~., data=train_data,
+                        ntree=ntree, 
+                        mtry=best_rf_param$mtry,
+                        nodesize=best_rf_param$node_size,
+                        sampsize=ceiling(best_rf_param$sample_size * nrow(train_data)))
+
+rf_prob <- predict(rf_best, test_data, type='prob')[,2]
+rf_pred <- ifelse(rf_prob > 0.5, 1, 0)
+
+cat('accuracy:', mean(rf_pred == test_data$label))
+```
+
+```{r}
+confusionMatrix(factor(rf_pred), factor(test_data$label))
+```
+
+```{r}
+performance(rf_prob, as.factor(rf_pred), 'Random Forest', as.factor(test_data$label), "1")
+```
+
+#######################################這裡結束############################################
+
+## LDA 
+
+```{r, }
+library(text2vec)
+
+d <- as(as.matrix(text_dtM), 'CsparseMatrix')
+lda_model = LDA$new(n_topics = 2, doc_topic_prior = 0.1, topic_word_prior = 0.01)
+doc_topic_distr =   lda_model$fit_transform(x =d, 
+                                            n_iter = 1000,
+                                            convergence_tol = 0.0001, 
+                                            n_check_convergence = 25,
+                                            progressbar = TRUE)
+```
+
+```{r, }
+lda_model$get_top_words(n = 10, topic_number = 1:2, lambda = 1)
+```
+
+```{r, }
+#lda_model$plot()
+```
+
+
